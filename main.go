@@ -1,18 +1,36 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
+	"github.com/chrj/smtpd"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log"
 	"net"
+	"net/http"
 	"net/smtp"
 	"os"
-	"regexp"
+	"os/signal"
 	"strings"
-	"time"
+	"syscall"
+)
 
-	"github.com/chrj/smtpd"
+var (
+	mailsProcessed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "smtprelay_processed_emails_total",
+		Help: "The total number of processed emails, successfully or not",
+	})
+	mailsSuccesses = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "smtprelay_processed_emails_success",
+		Help: "The number of successfully processed emails",
+	})
+	mailsFailures = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "smtprelay_processed_emails_fail",
+		Help: "The number of unsuccessfully processed emails",
+	})
 )
 
 func connectionChecker(peer smtpd.Peer) error {
@@ -23,7 +41,7 @@ func connectionChecker(peer smtpd.Peer) error {
 		return smtpd.Error{Code: 421, Message: "Denied"}
 	}
 
-	nets := strings.Split(*allowedNets, " ")
+	nets := strings.Split(config["RELAY_ALLOWED_NETS"], ",")
 
 	for i := range nets {
 		_, allowedNet, _ := net.ParseCIDR(nets[i])
@@ -36,68 +54,26 @@ func connectionChecker(peer smtpd.Peer) error {
 	return smtpd.Error{Code: 421, Message: "Denied"}
 }
 
-func senderChecker(peer smtpd.Peer, addr string) error {
-	// check sender address from auth file if user is authenticated
-	if *allowedUsers != "" && peer.Username != "" {
-		_, email, err := AuthFetch(peer.Username)
-		if err != nil {
-			return smtpd.Error{Code: 451, Message: "Bad sender address"}
-		}
-
-		if strings.ToLower(addr) != strings.ToLower(email) {
-			return smtpd.Error{Code: 451, Message: "Bad sender address"}
-		}
-	}
-
-	if *allowedSender == "" {
-		return nil
-	}
-
-	re, err := regexp.Compile(*allowedSender)
-	if err != nil {
-		log.Printf("allowed_sender invalid: %v\n", err)
-		return smtpd.Error{Code: 451, Message: "Bad sender address"}
-	}
-
-	if re.MatchString(addr) {
-		return nil
-	}
-
-	return smtpd.Error{Code: 451, Message: "Bad sender address"}
-}
-
 func recipientChecker(peer smtpd.Peer, addr string) error {
-	if *allowedRecipients == "" {
+	if config["RELAY_ALLOWED_RECIPIENTS"] == "" {
 		return nil
 	}
 
-	re, err := regexp.Compile(*allowedRecipients)
-	if err != nil {
-		log.Printf("allowed_recipients invalid: %v\n", err)
-		return smtpd.Error{Code: 451, Message: "Bad recipient address"}
-	}
+	split := strings.Split(addr, "@")
+	destDomain := split[len(split) - 1]
 
-	if re.MatchString(addr) {
-		return nil
+	for _, valid := range strings.Split(config["RELAY_ALLOWED_RECIPIENTS"], ","){
+		if destDomain == valid{
+			return nil
+		}
 	}
 
 	return smtpd.Error{Code: 451, Message: "Bad recipient address"}
 }
 
-func authChecker(peer smtpd.Peer, username string, password string) error {
-	err := AuthCheckPassword(username, password)
-	if err != nil {
-		log.Printf("Auth error: %v\n", err)
-		return smtpd.Error{Code: 535, Message: "Authentication credentials invalid"}
-	}
-	return nil
-}
+
 
 func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
-	if *allowedUsers != "" && peer.Username == "" {
-		return smtpd.Error{Code: 530, Message: "Authentication Required"}
-	}
-
 	peerIP := ""
 	if addr, ok := peer.Addr.(*net.TCPAddr); ok {
 		peerIP = addr.IP.String()
@@ -107,26 +83,20 @@ func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
 		env.Recipients, peerIP)
 
 	var auth smtp.Auth
-	host, _, _ := net.SplitHostPort(*remoteHost)
+	host, _, _ := net.SplitHostPort(config["RELAY_REMOTE_HOST"])
 
-	if *remoteUser != "" && *remotePass != "" {
-		auth = smtp.PlainAuth("", *remoteUser, *remotePass, host)
+	if config["RELAY_REMOTE_USER"] != "" && config["RELAY_REMOTE_PASS"] != "" {
+		auth = smtp.PlainAuth("", config["RELAY_REMOTE_USER"], config["RELAY_REMOTE_PASS"], host)
 	}
 
 	env.AddReceivedLine(peer)
 
-	log.Printf("delivering using smarthost %s\n", *remoteHost)
+	log.Printf("delivering using smarthost %s\n", config["RELAY_REMOTE_HOST"])
 
-	var sender string
-
-	if *remoteSender == "" {
-		sender = env.Sender
-	} else {
-		sender = *remoteSender
-	}
+	sender := env.Sender
 
 	err := SendMail(
-		*remoteHost,
+		config["RELAY_REMOTE_HOST"],
 		auth,
 		sender,
 		env.Recipients,
@@ -134,10 +104,14 @@ func mailHandler(peer smtpd.Peer, env smtpd.Envelope) error {
 	)
 	if err != nil {
 		log.Printf("delivery failed: %v\n", err)
+		mailsFailures.Inc()
+		mailsProcessed.Inc()
 		return smtpd.Error{Code: 554, Message: "Forwarding failed"}
 	}
 
 	log.Printf("%s delivery successful\n", env.Recipients)
+	mailsSuccesses.Inc()
+	mailsProcessed.Inc()
 
 	return nil
 }
@@ -151,37 +125,30 @@ func main() {
 		os.Exit(0)
 	}
 
-	if *logFile != "" {
-		f, err := os.OpenFile(*logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	listeners := strings.Split(config["RELAY_LISTEN"], ",")
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	http.Handle("/metrics", promhttp.Handler())
+	srv := http.Server{Addr: ":2112", Handler: http.DefaultServeMux}
+
+	go func(){
+		err := srv.ListenAndServe()
 		if err != nil {
-			log.Fatalf("Error opening logfile: %v", err)
+			log.Println(err)
 		}
-		defer f.Close()
-
-		log.SetOutput(io.MultiWriter(os.Stdout, f))
-	}
-
-	listeners := strings.Split(*listen, " ")
+	}()
 
 	for i := range listeners {
 		listener := listeners[i]
 
 		server := &smtpd.Server{
-			Hostname:          *hostName,
-			WelcomeMessage:    *welcomeMsg,
+			Hostname:          config["RELAY_HOSTNAME"],
+			WelcomeMessage:    config["RELAY_HOSTNAME"] + " ESMTP Ready",
 			ConnectionChecker: connectionChecker,
-			SenderChecker:     senderChecker,
 			RecipientChecker:  recipientChecker,
 			Handler:           mailHandler,
-		}
-
-		if *allowedUsers != "" {
-			err := AuthLoadFile(*allowedUsers)
-			if err != nil {
-				log.Fatalf("Authentication file: %s\n", err)
-			}
-
-			server.Authenticator = authChecker
 		}
 
 		if strings.Index(listeners[i], "://") == -1 {
@@ -190,11 +157,11 @@ func main() {
 		} else if strings.HasPrefix(listeners[i], "starttls://") {
 			listener = strings.TrimPrefix(listener, "starttls://")
 
-			if *localCert == "" || *localKey == "" {
+			if config["RELAY_CERT_FILE"] == "" || config["RELAY_KEY_FILE"] == "" {
 				log.Fatal("TLS certificate/key not defined in config")
 			}
 
-			cert, err := tls.LoadX509KeyPair(*localCert, *localKey)
+			cert, err := tls.LoadX509KeyPair(config["RELAY_CERT_FILE"], config["RELAY_KEY_FILE"])
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -226,7 +193,7 @@ func main() {
 				},
 				Certificates: []tls.Certificate{cert},
 			}
-			server.ForceTLS = *localForceTLS
+			server.ForceTLS = config["RELAY_FORCE_TLS"] == "1"
 
 			log.Printf("Listen on %s (STARTSSL) ...\n", listener)
 			lsnr, err := net.Listen("tcp", listener)
@@ -240,11 +207,11 @@ func main() {
 
 			listener = strings.TrimPrefix(listener, "tls://")
 
-			if *localCert == "" || *localKey == "" {
+			if config["RELAY_CERT_FILE"] == "" || config["RELAY_KEY_FILE"] == "" {
 				log.Fatal("TLS certificate/key not defined in config")
 			}
 
-			cert, err := tls.LoadX509KeyPair(*localCert, *localKey)
+			cert, err := tls.LoadX509KeyPair(config["RELAY_CERT_FILE"], config["RELAY_KEY_FILE"])
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -293,7 +260,11 @@ func main() {
 		}
 	}
 
-	for true {
-		time.Sleep(time.Minute)
+	<-signalChan
+	fmt.Println("Shutting down server...")
+	err := srv.Shutdown(context.Background())
+	if err != nil {
+		log.Println(err)
 	}
+
 }

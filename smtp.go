@@ -67,7 +67,7 @@ func NewClient(conn net.Conn, host string) (*Client, error) {
 		text.Close()
 		return nil, err
 	}
-	c := &Client{Text: text, conn: conn, serverName: host, localName: *hostName}
+	c := &Client{Text: text, conn: conn, serverName: host, localName: config["RELAY_HOSTNAME"]}
 	_, c.tls = conn.(*tls.Conn)
 	return c, nil
 }

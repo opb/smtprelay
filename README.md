@@ -1,5 +1,19 @@
 # smtprelay
 
+## Fork README
+
+Main readme is below.
+
+This is a for which changes a few things:
+
+ - removes configuration by INI, relying instead on env vars, with backup defaults in code.
+ - adds some prometheus monitoring
+ - adds a Dockerfile
+ 
+It is intended that this will be run in docker, so these modifications make sense. Still need to sort out local TLS cert/key options.
+
+<hr>
+
 Simple Golang based SMTP relay/proxy server that accepts mail via SMTP
 and forwards it directly to another SMTP server.
 
