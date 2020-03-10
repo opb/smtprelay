@@ -1,9 +1,8 @@
-module github.com/decke/smtprelay
+module github.com/opb/smtprelay
 
 require (
 	github.com/chrj/smtpd v0.1.2
-	github.com/vharitonsky/iniflags v0.0.0-20180513140207-a33cd0b5f3de
-	golang.org/x/crypto v0.0.0-20200221231518-2aa609cf4a9d
+	github.com/prometheus/client_golang v1.5.0
 )
 
 go 1.13

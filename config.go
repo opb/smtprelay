@@ -2,8 +2,8 @@ package main
 
 import (
 	"flag"
-
-	"github.com/vharitonsky/iniflags"
+	"os"
+	"strings"
 )
 
 const (
@@ -11,24 +11,48 @@ const (
 )
 
 var (
-	logFile           = flag.String("logfile", "/var/log/smtprelay.log", "Path to logfile")
-	hostName          = flag.String("hostname", "localhost.localdomain", "Server hostname")
-	welcomeMsg        = flag.String("welcome_msg", "", "Welcome message for SMTP session")
-	listen            = flag.String("listen", "127.0.0.1:25 [::1]:25", "Address and port to listen for incoming SMTP")
-	localCert         = flag.String("local_cert", "", "SSL certificate for STARTTLS/TLS")
-	localKey          = flag.String("local_key", "", "SSL private key for STARTTLS/TLS")
-	localForceTLS     = flag.Bool("local_forcetls", false, "Force STARTTLS (needs local_cert and local_key)")
-	allowedNets       = flag.String("allowed_nets", "127.0.0.1/8 ::1/128", "Networks allowed to send mails")
-	allowedSender     = flag.String("allowed_sender", "", "Regular expression for valid FROM EMail adresses")
-	allowedRecipients = flag.String("allowed_recipients", "", "Regular expression for valid TO EMail adresses")
-	allowedUsers      = flag.String("allowed_users", "", "Path to file with valid users/passwords")
-	remoteHost        = flag.String("remote_host", "smtp.gmail.com:587", "Outgoing SMTP server")
-	remoteUser        = flag.String("remote_user", "", "Username for authentication on outgoing SMTP server")
-	remotePass        = flag.String("remote_pass", "", "Password for authentication on outgoing SMTP server")
-	remoteSender      = flag.String("remote_sender", "", "Sender e-mail address on outgoing SMTP server")
 	versionInfo       = flag.Bool("version", false, "Show version information")
 )
 
+var config = map[string]string{}
+
 func ConfigLoad() {
-	iniflags.Parse()
+	flag.Parse()
+
+	config = map[string]string{
+		"RELAY_HOSTNAME": "localhost.localdomain",
+		"RELAY_LISTEN": "127.0.0.1:2525", // tls://127.0.0.1:465,starttls://127.0.0.1:587 (multiple, comma separated)
+		"RELAY_ALLOWED_NETS": "127.0.0.1/32", // comma separated CIDR ranges for email sources
+		"RELAY_ALLOWED_RECIPIENTS": "", // comma separated domains for valid destinations
+		"RELAY_REMOTE_HOST": "", // IP:Port
+		"RELAY_REMOTE_USER": "",
+		"RELAY_REMOTE_PASS": "",
+		"RELAY_FORCE_TLS": "0",
+		"RELAY_CERT_FILE": "smtpd.pem", // X509 file
+		"RELAY_KEY_FILE": "smtpd.key", // X509 file
+	}
+
+	boolOptions := []string{"RELAY_FORCE_TLS"}
+
+	for k := range config{
+		if  t := os.Getenv(k); t != ""{
+			config[k] = t
+		}
+	}
+
+	for _, o := range boolOptions{
+		config[o] = boolString(config[o])
+	}
+}
+
+func boolString(input string) string{
+	valid := []string{"y", "yes", "true", "1"}
+	i := strings.ToLower(input)
+	for _, v := range valid{
+		if i == v{
+			return "1"
+		}
+	}
+
+	return "0"
 }
